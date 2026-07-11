@@ -1,0 +1,20 @@
+name: Frontend Application
+
+on:
+  push:
+    branches:
+    - main
+
+
+jobs:
+  buils:
+    runs-on: ubuntu-latest
+
+    steps:
+      
+      - name: checkout code
+      - uses: actions/checkout@v4
+
+      - name: test
+        run: echo "test working"
+   
