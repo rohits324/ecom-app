@@ -24,7 +24,7 @@ jobs:
         run: npm install
 
       - name: build application
-        run: mvn run build
+        run: npm run build
    
       - name: test
         run: echo "test working"
