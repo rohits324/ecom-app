@@ -25,6 +25,9 @@ jobs:
 
       - name: build application
         run: CI=false npm run build
+
+      - name: build docker image
+        run: docker build -t ecom-app .
    
       - name: test
         run: echo "test working"
