@@ -15,6 +15,16 @@ jobs:
       - name: checkout code
         uses: actions/checkout@v4
 
+      - name: Get base Image of Node 18
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18
+
+      - name: install depedancy
+        run: npm install
+
+      - name: build application
+        run: mvn run build
+   
       - name: test
         run: echo "test working"
-   
