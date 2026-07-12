@@ -28,6 +28,15 @@ jobs:
 
       - name: build docker image
         run: docker build -t ecom-app .
+
+       # Trivy Docker Image Scan
+      - name: Run Trivy Image Scan
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ecom-app
+          format: table
+          severity: HIGH,CRITICAL
+          exit-code: '1'
    
       - name: test
         run: echo "test working"
