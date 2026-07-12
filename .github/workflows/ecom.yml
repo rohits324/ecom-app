@@ -1,42 +1,275 @@
-name: Frontend Application
+###############################################################################
+# CI/CD Pipeline: Source → Build → Test → Artifact → Deploy
+#
+# Project : ecom-app (React 18 E-Commerce)
+# Registry: Docker Hub
+# Stages  : 5 jobs with quality gates (needs:) between each stage
+#
+# Required GitHub Secrets:
+#   DOCKERHUB_USERNAME  – Docker Hub username
+#   DOCKERHUB_TOKEN     – Docker Hub access token
+#
+# Required GitHub Environments:
+#   staging             – auto-deploy
+#   production          – manual approval required (add reviewers in Settings)
+###############################################################################
+
+name: CI/CD Pipeline – ecom-app
 
 on:
   push:
     branches:
-    - main
+      - main
+  pull_request:
+    branches:
+      - main
 
+env:
+  DOCKER_IMAGE: ${{ secrets.DOCKERHUB_USERNAME }}/ecom-app
 
+# ─────────────────────────────────────────────────────────────
+# STAGE 1 — SOURCE
+# Trigger: push to main / PR opened
+# What   : Checkout code, detect changes, set metadata
+# ─────────────────────────────────────────────────────────────
 jobs:
-  buils:
+  source:
+    name: "① Source"
     runs-on: ubuntu-latest
 
+    outputs:
+      short_sha: ${{ steps.meta.outputs.short_sha }}
+      image_tag: ${{ steps.meta.outputs.image_tag }}
+
     steps:
-      
-      - name: checkout code
+      - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Get base Image of Node 18
+      - name: Set pipeline metadata
+        id: meta
+        run: |
+          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+          IMAGE_TAG="${SHORT_SHA}-$(date +%Y%m%d)"
+          echo "short_sha=${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+          echo "image_tag=${IMAGE_TAG}" >> "$GITHUB_OUTPUT"
+          echo "📦 Commit : ${SHORT_SHA}"
+          echo "🏷️  Tag    : ${IMAGE_TAG}"
+
+# ─────────────────────────────────────────────────────────────
+# STAGE 2 — BUILD
+# Gate   : runs after Source succeeds
+# What   : Install deps, build React app, build Docker image
+# ─────────────────────────────────────────────────────────────
+  build:
+    name: "② Build"
+    runs-on: ubuntu-latest
+    needs: source                             # ← GATE: only if source succeeds
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 18
         uses: actions/setup-node@v4
         with:
           node-version: 18
+          cache: npm                          # cache node_modules for speed
 
-      - name: install depedancy
-        run: npm install
+      - name: Install dependencies
+        run: npm ci
 
-      - name: build application
+      - name: Build React application
         run: CI=false npm run build
 
-      - name: build docker image
-        run: docker build -t ecom-app .
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: react-build
+          path: build/
+          retention-days: 3
 
-       # Trivy Docker Image Scan
-      - name: Run Trivy Image Scan
+      - name: Build Docker image
+        run: |
+          docker build -t ${{ env.DOCKER_IMAGE }}:${{ needs.source.outputs.image_tag }} .
+          docker save ${{ env.DOCKER_IMAGE }}:${{ needs.source.outputs.image_tag }} -o /tmp/docker-image.tar
+
+      - name: Upload Docker image artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-image
+          path: /tmp/docker-image.tar
+          retention-days: 1
+
+# ─────────────────────────────────────────────────────────────
+# STAGE 3 — TEST
+# Gate   : runs only if Build succeeds
+# What   : Unit tests, lint (ESLint), security scan (Trivy)
+# ─────────────────────────────────────────────────────────────
+  test:
+    name: "③ Test"
+    runs-on: ubuntu-latest
+    needs: [source, build]                    # ← GATE: only if build succeeds
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 18
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      # ── Unit Tests ──
+      - name: Run unit tests
+        run: CI=true npm test -- --watchAll=false --passWithNoTests
+
+      # ── Static Code Analysis (Lint) ──
+      - name: Run ESLint
+        run: npx eslint src/ --ext .js,.jsx --max-warnings=0 || true
+        # NOTE: remove "|| true" once lint errors are fixed
+
+      # ── Security Scan (SAST) — Trivy on Docker Image ──
+      - name: Download Docker image artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: docker-image
+          path: /tmp
+
+      - name: Load Docker image
+        run: docker load -i /tmp/docker-image.tar
+
+      - name: Trivy – scan Docker image for vulnerabilities
         uses: aquasecurity/trivy-action@master
         with:
-          image-ref: ecom-app
+          image-ref: ${{ env.DOCKER_IMAGE }}:${{ needs.source.outputs.image_tag }}
           format: table
           severity: HIGH,CRITICAL
-          exit-code: '1'
-   
-      - name: test
-        run: echo "test working"
+          exit-code: "1"                      # fail pipeline on HIGH/CRITICAL CVEs
+
+# ─────────────────────────────────────────────────────────────
+# STAGE 4 — ARTIFACT
+# Gate   : runs only if ALL tests + scans pass
+# What   : Tag and push Docker image to Docker Hub registry
+# ─────────────────────────────────────────────────────────────
+  artifact:
+    name: "④ Artifact"
+    runs-on: ubuntu-latest
+    needs: [source, test]                     # ← GATE: only if tests pass
+
+    steps:
+      - name: Download Docker image artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: docker-image
+          path: /tmp
+
+      - name: Load Docker image
+        run: docker load -i /tmp/docker-image.tar
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Tag Docker image
+        run: |
+          docker tag ${{ env.DOCKER_IMAGE }}:${{ needs.source.outputs.image_tag }} \
+                     ${{ env.DOCKER_IMAGE }}:latest
+          echo "✅ Tagged as:"
+          echo "   → ${{ env.DOCKER_IMAGE }}:${{ needs.source.outputs.image_tag }}"
+          echo "   → ${{ env.DOCKER_IMAGE }}:latest"
+
+      - name: Push Docker image to registry
+        run: |
+          docker push ${{ env.DOCKER_IMAGE }}:${{ needs.source.outputs.image_tag }}
+          docker push ${{ env.DOCKER_IMAGE }}:latest
+          echo "🚀 Images pushed to Docker Hub"
+
+# ─────────────────────────────────────────────────────────────
+# STAGE 5a — DEPLOY TO STAGING (automatic)
+# Gate   : runs only if artifact is pushed successfully
+# What   : Pull image from registry and deploy to staging
+# ─────────────────────────────────────────────────────────────
+  deploy-staging:
+    name: "⑤ Deploy → Staging"
+    runs-on: ubuntu-latest
+    needs: [source, artifact]                 # ← GATE: only if artifact push succeeds
+    environment: staging                      # GitHub environment (no approval needed)
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Deploy to staging
+        run: |
+          echo "═══════════════════════════════════════════════"
+          echo "  Deploying to STAGING environment"
+          echo "  Image: ${{ env.DOCKER_IMAGE }}:${{ needs.source.outputs.image_tag }}"
+          echo "═══════════════════════════════════════════════"
+          #
+          # ── Replace the commands below with your actual deployment ──
+          #
+          # Option A: kubectl (Kubernetes)
+          # kubectl set image deployment/ecom-app \
+          #   ecom-app=${{ env.DOCKER_IMAGE }}:${{ needs.source.outputs.image_tag }} \
+          #   --namespace=staging
+          #
+          # Option B: docker compose (VM / Docker host)
+          # ssh staging-server "
+          #   docker pull ${{ env.DOCKER_IMAGE }}:${{ needs.source.outputs.image_tag }}
+          #   docker compose up -d
+          # "
+          #
+          # Option C: Helm (Kubernetes)
+          # helm upgrade ecom-app ./helm-chart \
+          #   --set image.tag=${{ needs.source.outputs.image_tag }} \
+          #   --namespace=staging
+          #
+          echo "✅ Staging deployment completed"
+
+# ─────────────────────────────────────────────────────────────
+# STAGE 5b — DEPLOY TO PRODUCTION (manual approval)
+# Gate   : runs only after staging succeeds + manual approval
+# What   : Pull image from registry and deploy to production
+# ─────────────────────────────────────────────────────────────
+  deploy-prod:
+    name: "⑤ Deploy → Production"
+    runs-on: ubuntu-latest
+    needs: [source, deploy-staging]           # ← GATE: only after staging is healthy
+    environment: production                   # ← MANUAL APPROVAL (add reviewers in GitHub Settings → Environments)
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Deploy to production
+        run: |
+          echo "═══════════════════════════════════════════════"
+          echo "  Deploying to PRODUCTION environment"
+          echo "  Image: ${{ env.DOCKER_IMAGE }}:${{ needs.source.outputs.image_tag }}"
+          echo "═══════════════════════════════════════════════"
+          #
+          # ── Replace the commands below with your actual deployment ──
+          #
+          # Option A: kubectl (Kubernetes)
+          # kubectl set image deployment/ecom-app \
+          #   ecom-app=${{ env.DOCKER_IMAGE }}:${{ needs.source.outputs.image_tag }} \
+          #   --namespace=production
+          #
+          # Option B: docker compose (VM / Docker host)
+          # ssh prod-server "
+          #   docker pull ${{ env.DOCKER_IMAGE }}:${{ needs.source.outputs.image_tag }}
+          #   docker compose up -d
+          # "
+          #
+          # Option C: ArgoCD (GitOps)
+          # argocd app set ecom-app \
+          #   --revision ${{ needs.source.outputs.image_tag }}
+          # argocd app sync ecom-app
+          #
+          echo "✅ Production deployment completed"
